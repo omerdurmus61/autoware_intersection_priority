@@ -1,0 +1,16 @@
+/**:
+  ros__parameters:
+    intersection_id: "1"
+    virtual_traffic_light_id: "2012980"
+    virtual_traffic_light_type: "virtual"
+    virtual_traffic_light_publish_rate_hz: 10.0
+
+    vector_map_topic: "/map/vector_map"
+    tracked_objects_topic: "/perception/object_recognition/tracking/objects"
+    odometry_topic: "/localization/kinematic_state"
+    virtual_traffic_light_state_topic: "/awapi/tmp/virtual_traffic_light_states"
+
+    tracked_object_timeout_sec: 4.0
+    conflict_clear_duration_sec: 0.5
+    tracked_objects_freshness_sec: 0.5
+    allow_unknown_objects: true

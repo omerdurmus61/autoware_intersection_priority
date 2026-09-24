@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.14)
 project(autoware_intersection_priority)
 
 find_package(autoware_cmake REQUIRED)
-# Discovers and links dependencies declared in package.xml, including map conversion.
+# Discovers and links package.xml dependencies, including map conversion and tier4_v2x_msgs.
 autoware_package()
 
 ament_auto_add_executable(autoware_intersection_priority_node

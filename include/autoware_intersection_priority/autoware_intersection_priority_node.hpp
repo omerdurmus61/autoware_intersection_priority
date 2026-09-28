@@ -90,6 +90,7 @@ private:
   void remove_tracked_object(const std::string & uuid, const char * event);
   void remove_stale_objects(const rclcpp::Time & receive_time);
   void update_approval_conditions(const rclcpp::Time & receive_time);
+  void log_waiting_status(const rclcpp::Time & receive_time);
   void publish_virtual_traffic_light();
   void set_approval(bool granted);
 
@@ -107,6 +108,11 @@ private:
   std::map<std::string, rclcpp::Time> object_last_seen_times_;
   std::optional<rclcpp::Time> last_tracked_objects_time_;
   std::optional<rclcpp::Time> approval_conditions_since_;
+  // Diagnostics only: these fields do not participate in approval decisions.
+  std::optional<rclcpp::Time> last_objects_message_time_;
+  std::string object_data_status_{"NOT_RECEIVED"};
+  std::string last_waiting_key_;
+  std::optional<rclcpp::Time> last_waiting_log_time_;
 
   rclcpp::Subscription<autoware_map_msgs::msg::LaneletMapBin>::SharedPtr map_subscription_;
   rclcpp::Subscription<autoware_perception_msgs::msg::TrackedObjects>::SharedPtr

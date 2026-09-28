@@ -80,6 +80,24 @@ IntersectionPriorityNode::IntersectionPriorityNode(const rclcpp::NodeOptions & o
       vtl_topic, rclcpp::QoS{10});
   virtual_traffic_light_timer_ = create_wall_timer(
     publish_period, std::bind(&IntersectionPriorityNode::publish_virtual_traffic_light, this));
+  RCLCPP_INFO(
+    get_logger(),
+    "CONFIGURATION: intersection_id=%s, virtual_traffic_light_id=%s, "
+    "virtual_traffic_light_type=%s, virtual_traffic_light_publish_rate_hz=%.3f",
+    intersection_id_.c_str(), virtual_traffic_light_id_.c_str(),
+    virtual_traffic_light_type_.c_str(), publish_rate);
+  RCLCPP_INFO(
+    get_logger(),
+    "CONFIGURATION: tracked_object_timeout_sec=%.3f, "
+    "tracked_objects_freshness_sec=%.3f, conflict_clear_duration_sec=%.3f, "
+    "allow_unknown_objects=%s, health_check_clock=steady",
+    tracked_object_timeout_sec_, tracked_objects_freshness_sec_, conflict_clear_duration_sec_,
+    allow_unknown_objects_ ? "true" : "false");
+  RCLCPP_INFO(
+    get_logger(),
+    "TOPICS: vector_map=%s, tracked_objects=%s, odometry=%s, virtual_traffic_light=%s",
+    map_subscription_->get_topic_name(), objects_subscription_->get_topic_name(),
+    odometry_subscription_->get_topic_name(), virtual_traffic_light_publisher_->get_topic_name());
 }
 
 bool IntersectionPriorityNode::contains(
@@ -304,15 +322,18 @@ bool IntersectionPriorityNode::is_allowed_object(
 
 void IntersectionPriorityNode::remove_tracked_object(const std::string & uuid, const char * event)
 {
+  const auto seen = object_last_seen_times_.find(uuid);
+  const auto age =
+    seen == object_last_seen_times_.end() ? -1.0 : (receive_clock_.now() - seen->second).seconds();
   for (auto it = object_zone_states_.begin(); it != object_zone_states_.end();) {
     if (it->first.first != uuid) {
       ++it;
       continue;
     }
     RCLCPP_INFO(
-      get_logger(), "%s: UUID=%s, intersection_id=%s, previous_state=%s", event, uuid.c_str(),
-      it->first.second.empty() ? "<missing>" : it->first.second.c_str(),
-      state_name(it->second.state));
+      get_logger(), "%s: UUID=%s, intersection_id=%s, previous_state=%s, last_seen_age=%.3fs",
+      event, uuid.c_str(), it->first.second.empty() ? "<missing>" : it->first.second.c_str(),
+      state_name(it->second.state), age);
     it = object_zone_states_.erase(it);
   }
   for (auto & [intersection_id, queue] : arrival_queues_) {
@@ -341,7 +362,9 @@ void IntersectionPriorityNode::remove_stale_objects(const rclcpp::Time & receive
 void IntersectionPriorityNode::on_objects(
   const autoware_perception_msgs::msg::TrackedObjects::ConstSharedPtr msg)
 {
+  last_objects_message_time_ = receive_clock_.now();
   if (msg->header.frame_id != "map") {
+    object_data_status_ = "INVALID_FRAME";
     last_tracked_objects_time_.reset();
     approval_conditions_since_.reset();
     RCLCPP_WARN_THROTTLE(
@@ -353,6 +376,7 @@ void IntersectionPriorityNode::on_objects(
   // Detect gaps before refreshing the timestamp, including gaps between timer ticks.
   update_approval_conditions(receive_time);
   last_tracked_objects_time_ = receive_time;
+  object_data_status_ = "VALID";
   bool valid_positions = true;
   for (const auto & object : msg->objects) {
     std::ostringstream uuid_stream;
@@ -382,6 +406,7 @@ void IntersectionPriorityNode::on_objects(
     update_zone_state(uuid, "", ungrouped_polygons_, point, observation_time);
   }
   if (!valid_positions) {
+    object_data_status_ = "INVALID_POSITION";
     last_tracked_objects_time_.reset();
   }
   update_approval_conditions(receive_time);
@@ -393,6 +418,8 @@ void IntersectionPriorityNode::set_approval(const bool granted)
     return;
   }
   approval_granted_ = granted;
+  last_waiting_key_.clear();
+  last_waiting_log_time_.reset();
   approval_conditions_since_.reset();
   RCLCPP_INFO(
     get_logger(), "%s: intersection_id=%s, virtual_traffic_light_id=%s",
@@ -426,6 +453,119 @@ void IntersectionPriorityNode::update_approval_conditions(const rclcpp::Time & r
   }
 }
 
+void IntersectionPriorityNode::log_waiting_status(const rclcpp::Time & receive_time)
+{
+  const auto ego = ego_zone_states_.find(intersection_id_);
+  if (
+    approval_granted_ || ego == ego_zone_states_.end() || ego->second.state == ZoneState::OUTSIDE) {
+    last_waiting_key_.clear();
+    last_waiting_log_time_.reset();
+    return;
+  }
+
+  const auto queue = arrival_queues_.find(intersection_id_);
+  std::size_t ego_position = 0;
+  const std::size_t queue_size = queue == arrival_queues_.end() ? 0 : queue->second.size();
+  std::string queue_head;
+  std::string queue_head_state;
+  if (queue != arrival_queues_.end()) {
+    for (std::size_t i = 0; i < queue->second.size(); ++i) {
+      if (queue->second[i].type == ParticipantType::EGO) {
+        ego_position = i + 1;
+      }
+    }
+    if (!queue->second.empty()) {
+      queue_head = queue->second.front().identifier;
+      queue_head_state = state_name(queue->second.front().state);
+    }
+  }
+  std::vector<std::string> blockers;
+  for (const auto & [key, tracked] : object_zone_states_) {
+    if (key.second == intersection_id_ && tracked.state == ZoneState::CONFLICT) {
+      blockers.push_back(key.first);
+    }
+  }
+  const double data_age =
+    last_tracked_objects_time_ ? (receive_time - *last_tracked_objects_time_).seconds() : -1.0;
+  const bool fresh = data_age >= 0.0 && data_age <= tracked_objects_freshness_sec_;
+  const auto data_status =
+    object_data_status_ == "VALID" && !fresh ? std::string{"STALE"} : object_data_status_;
+  const char * reason = "CLEAR_DURATION_PENDING";
+  if (ego->second.state != ZoneState::PRIORITY) {
+    reason = "EGO_NOT_IN_PRIORITY";
+  } else if (ego_position == 0) {
+    reason = "EGO_NOT_IN_QUEUE";
+  } else if (!fresh) {
+    reason = "OBJECT_DATA_STALE";
+  } else if (!blockers.empty()) {
+    reason = "CONFLICT_OCCUPIED";
+  } else if (ego_position != 1) {
+    reason = "EGO_NOT_FIRST";
+  }
+
+  // Ages are deliberately excluded from this key to avoid per-frame INFO logs.
+  std::ostringstream key;
+  key << reason << '|' << state_name(ego->second.state) << '|' << ego_position << '|' << queue_size
+      << '|' << queue_head << '|' << queue_head_state << '|' << data_status;
+  for (const auto & uuid : blockers) {
+    key << '|' << uuid;
+  }
+  const bool changed = key.str() != last_waiting_key_;
+  if (
+    !changed && last_waiting_log_time_ &&
+    (receive_time - *last_waiting_log_time_).seconds() < 1.0) {
+    return;
+  }
+  last_waiting_key_ = key.str();
+  last_waiting_log_time_ = receive_time;
+  const auto emit = [this, changed](const std::string & message) {
+    if (changed) {
+      RCLCPP_INFO(get_logger(), "%s", message.c_str());
+    } else {
+      RCLCPP_DEBUG(get_logger(), "%s", message.c_str());
+    }
+  };
+  const auto age_text = [](const std::optional<rclcpp::Time> & time, const rclcpp::Time & now) {
+    if (!time) {
+      return std::string{"unavailable"};
+    }
+    std::ostringstream value;
+    value << std::fixed << std::setprecision(3) << (now - *time).seconds() << 's';
+    return value.str();
+  };
+  const auto head_seen = object_last_seen_times_.find(queue_head);
+  const std::optional<rclcpp::Time> head_last_seen =
+    head_seen == object_last_seen_times_.end() ? std::nullopt
+                                               : std::optional<rclcpp::Time>{head_seen->second};
+  std::ostringstream summary;
+  summary << "WAITING: intersection_id=" << intersection_id_ << ", reason=" << reason
+          << ", ego_state=" << state_name(ego->second.state)
+          << ", ego_queue_position=" << ego_position << ", queue_size=" << queue_size
+          << ", queue_head=" << (queue_head.empty() ? "none" : queue_head)
+          << ", queue_head_state=" << (queue_head_state.empty() ? "none" : queue_head_state)
+          << ", queue_head_last_seen_age=" << age_text(head_last_seen, receive_time)
+          << ", object_data_status=" << data_status
+          << ", data_age=" << age_text(last_tracked_objects_time_, receive_time)
+          << ", last_message_age=" << age_text(last_objects_message_time_, receive_time)
+          << ", freshness_limit=" << tracked_objects_freshness_sec_ << 's'
+          << ", conflict_objects=" << blockers.size()
+          << ", clear_elapsed=" << age_text(approval_conditions_since_, receive_time)
+          << ", clear_required=" << conflict_clear_duration_sec_ << 's';
+  emit(summary.str());
+  for (const auto & uuid : blockers) {
+    const auto seen = object_last_seen_times_.find(uuid);
+    const std::optional<rclcpp::Time> last_seen = seen == object_last_seen_times_.end()
+                                                    ? std::nullopt
+                                                    : std::optional<rclcpp::Time>{seen->second};
+    std::ostringstream blocker;
+    blocker << "WAITING_BLOCKER: intersection_id=" << intersection_id_
+            << ", reason=CONFLICT_OCCUPIED, UUID=" << uuid
+            << ", last_seen_age=" << age_text(last_seen, receive_time)
+            << ", timeout=" << tracked_object_timeout_sec_ << 's';
+    emit(blocker.str());
+  }
+}
+
 void IntersectionPriorityNode::publish_virtual_traffic_light()
 {
   const auto receive_time = receive_clock_.now();
@@ -437,6 +577,8 @@ void IntersectionPriorityNode::publish_virtual_traffic_light()
     (receive_time - *approval_conditions_since_).seconds() >= conflict_clear_duration_sec_) {
     set_approval(true);
   }
+
+  log_waiting_status(receive_time);
 
   const auto stamp = now();
   tier4_v2x_msgs::msg::VirtualTrafficLightStateArray message;
@@ -477,6 +619,10 @@ void IntersectionPriorityNode::on_map(
   }
   object_zone_states_.clear();
   object_last_seen_times_.clear();
+  last_objects_message_time_.reset();
+  object_data_status_ = "NOT_RECEIVED";
+  last_waiting_key_.clear();
+  last_waiting_log_time_.reset();
   last_tracked_objects_time_.reset();
   approval_conditions_since_.reset();
   intersections_.clear();

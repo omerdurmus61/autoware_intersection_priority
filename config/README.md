@@ -31,3 +31,52 @@ preserving exit detection for an already-latched grant.
 
 Publish rate, timeout and freshness must be finite and positive; clear duration
 must be finite and nonnegative. Zero clear duration disables the waiting interval.
+
+## Field-test diagnostics
+
+Startup `CONFIGURATION` logs show the effective IDs, publication rate, timeout,
+freshness, clear duration, and UNKNOWN setting. `TOPICS` shows resolved topic
+names, including ROS remappings.
+
+While ego is in PRIORITY or CONFLICT without approval, `WAITING` reports the
+primary blocking reason and all relevant gate values. INFO logs appear only
+when the reason, ego/queue state, data status, or conflicting UUID list changes.
+When multiple conditions fail, consult the full snapshot and `WAITING_BLOCKER`
+lines, not only the primary reason.
+
+- `CONFLICT_OCCUPIED`: each `WAITING_BLOCKER` lists a conflicting UUID, its
+  monotonic `last_seen_age`, and the configured timeout.
+- `OBJECT_DATA_STALE`: `object_data_status` distinguishes `NOT_RECEIVED`, `STALE`,
+  `INVALID_FRAME`, and `INVALID_POSITION`. `last_message_age` includes invalid
+  incoming messages; `data_age` measures the current usable observation.
+- `EGO_NOT_FIRST` / `EGO_NOT_IN_QUEUE`: inspect queue position (0 means absent),
+  size, head identifier/state, and the head object's last-seen age.
+  A retained OUTSIDE queue head can explain waiting after boundary noise.
+- `EGO_NOT_IN_PRIORITY`: ego is already in CONFLICT and cannot receive a new grant.
+- `CLEAR_DURATION_PENDING`: compare `clear_elapsed` with `clear_required`.
+  `unavailable` means the valid-condition interval has not started.
+
+Enable DEBUG for updated snapshots at most once per second while the situation
+stays unchanged (stop the launched instance before starting another publisher):
+
+```bash
+ros2 run autoware_intersection_priority autoware_intersection_priority_node \
+  --ros-args --params-file "$(ros2 pkg prefix autoware_intersection_priority)/share/autoware_intersection_priority/config/autoware_intersection_priority.param.yaml" \
+  --log-level autoware_intersection_priority:=debug
+```
+
+A last-seen age repeatedly near zero means the UUID is still arriving, even if
+its stored zone never changes. An increasing age followed by timeout indicates
+a missing track. Timeout/filter logs also include the last-seen age; -1 denotes
+unavailable history. These diagnostics do not change approval or queue logic.
+
+For the next field test, record the input/output topics in a separate terminal:
+
+```bash
+ros2 bag record /map/vector_map \
+  /perception/object_recognition/tracking/objects \
+  /localization/kinematic_state /awapi/tmp/virtual_traffic_light_states /clock
+```
+
+Use your configured topic names if they differ from these defaults. Preserve
+this node's console logs and the effective parameter YAML alongside the bag.

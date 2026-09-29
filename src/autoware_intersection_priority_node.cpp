@@ -26,8 +26,38 @@ namespace autoware::intersection_priority
 IntersectionPriorityNode::IntersectionPriorityNode(const rclcpp::NodeOptions & options)
 : Node("autoware_intersection_priority", options)
 {
-  intersection_id_ = declare_parameter<std::string>("intersection_id", "1");
-  virtual_traffic_light_id_ = declare_parameter<std::string>("virtual_traffic_light_id", "2012980");
+  const auto intersection_ids =
+    declare_parameter<std::vector<std::string>>("intersection_ids", std::vector<std::string>{});
+  const auto add_light = [this](const std::string & intersection_id, const std::string & light_id) {
+    if (intersection_id.empty() || light_id.empty()) {
+      throw std::invalid_argument(
+        "Intersection ID and virtual traffic light ID must not be empty.");
+    }
+    if (
+      std::any_of(
+        virtual_traffic_lights_.begin(), virtual_traffic_lights_.end(),
+        [&light_id](const auto & entry) { return entry.second.id == light_id; })) {
+      throw std::invalid_argument("Duplicate virtual traffic light ID: " + light_id);
+    }
+    VirtualTrafficLightControl control;
+    control.id = light_id;
+    virtual_traffic_lights_.emplace(intersection_id, std::move(control));
+  };
+  if (intersection_ids.empty()) {
+    // Keep existing single-intersection parameter files and bare ros2 run working.
+    const auto intersection_id = declare_parameter<std::string>("intersection_id", "1");
+    const auto light_id = declare_parameter<std::string>("virtual_traffic_light_id", "2012980");
+    add_light(intersection_id, light_id);
+  } else {
+    for (const auto & intersection_id : intersection_ids) {
+      if (intersection_id.empty() || virtual_traffic_lights_.count(intersection_id) != 0) {
+        throw std::invalid_argument("Empty or duplicate intersection ID: " + intersection_id);
+      }
+      const auto light_id = declare_parameter<std::string>(
+        "intersections." + intersection_id + ".virtual_traffic_light_id", "");
+      add_light(intersection_id, light_id);
+    }
+  }
   virtual_traffic_light_type_ =
     declare_parameter<std::string>("virtual_traffic_light_type", "virtual");
   const auto publish_rate =
@@ -52,11 +82,8 @@ IntersectionPriorityNode::IntersectionPriorityNode(const rclcpp::NodeOptions & o
       "Publish rate, object timeout and freshness must be finite and positive; "
       "conflict clear duration must be finite and nonnegative.");
   }
-  if (
-    intersection_id_.empty() || virtual_traffic_light_id_.empty() ||
-    virtual_traffic_light_type_.empty()) {
-    throw std::invalid_argument(
-      "Intersection ID and virtual traffic light ID/type must not be empty.");
+  if (virtual_traffic_light_type_.empty()) {
+    throw std::invalid_argument("Virtual traffic light type must not be empty.");
   }
   const double period_sec = 1.0 / publish_rate;
   if (
@@ -80,12 +107,14 @@ IntersectionPriorityNode::IntersectionPriorityNode(const rclcpp::NodeOptions & o
       vtl_topic, rclcpp::QoS{10});
   virtual_traffic_light_timer_ = create_wall_timer(
     publish_period, std::bind(&IntersectionPriorityNode::publish_virtual_traffic_light, this));
-  RCLCPP_INFO(
-    get_logger(),
-    "CONFIGURATION: intersection_id=%s, virtual_traffic_light_id=%s, "
-    "virtual_traffic_light_type=%s, virtual_traffic_light_publish_rate_hz=%.3f",
-    intersection_id_.c_str(), virtual_traffic_light_id_.c_str(),
-    virtual_traffic_light_type_.c_str(), publish_rate);
+  for (const auto & [intersection_id, control] : virtual_traffic_lights_) {
+    RCLCPP_INFO(
+      get_logger(),
+      "CONFIGURATION: intersection_id=%s, virtual_traffic_light_id=%s, "
+      "virtual_traffic_light_type=%s, virtual_traffic_light_publish_rate_hz=%.3f",
+      intersection_id.c_str(), control.id.c_str(), virtual_traffic_light_type_.c_str(),
+      publish_rate);
+  }
   RCLCPP_INFO(
     get_logger(),
     "CONFIGURATION: tracked_object_timeout_sec=%.3f, "
@@ -151,7 +180,7 @@ IntersectionPriorityNode::ZoneState IntersectionPriorityNode::zone_state(
 void IntersectionPriorityNode::on_odometry(const nav_msgs::msg::Odometry::ConstSharedPtr msg)
 {
   if (msg->header.frame_id != "map") {
-    approval_conditions_since_.reset();
+    reset_pending_approvals();
     RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), 5000, "Skipping ego odometry in frame '%s'; expected 'map'.",
       msg->header.frame_id.c_str());
@@ -160,7 +189,7 @@ void IntersectionPriorityNode::on_odometry(const nav_msgs::msg::Odometry::ConstS
   const auto & position = msg->pose.pose.position;
   const auto speed = msg->twist.twist.linear.x;
   if (!std::isfinite(position.x) || !std::isfinite(position.y)) {
-    approval_conditions_since_.reset();
+    reset_pending_approvals();
     return;
   }
   const lanelet::BasicPoint2d point{position.x, position.y};
@@ -174,15 +203,9 @@ void IntersectionPriorityNode::on_odometry(const nav_msgs::msg::Odometry::ConstS
       if (!ego.priority_entry_time) {
         ego.priority_entry_time = rclcpp::Time{msg->header.stamp};
       }
-      active_intersection_id_ = intersection_id;
     } else if (new_state == ZoneState::OUTSIDE) {
-      if (intersection_id == intersection_id_) {
-        set_approval(false);
-      }
+      set_approval(intersection_id, false);
       ego.priority_entry_time.reset();
-      if (active_intersection_id_ == intersection_id) {
-        active_intersection_id_.reset();
-      }
     }
     const char * event = new_state == ZoneState::CONFLICT   ? "EGO_ENTERED_CONFLICT"
                          : new_state == ZoneState::PRIORITY ? "EGO_ENTERED_PRIORITY"
@@ -366,7 +389,7 @@ void IntersectionPriorityNode::on_objects(
   if (msg->header.frame_id != "map") {
     object_data_status_ = "INVALID_FRAME";
     last_tracked_objects_time_.reset();
-    approval_conditions_since_.reset();
+    reset_pending_approvals();
     RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), 5000, "Skipping tracked objects in frame '%s'; expected 'map'.",
       msg->header.frame_id.c_str());
@@ -412,58 +435,78 @@ void IntersectionPriorityNode::on_objects(
   update_approval_conditions(receive_time);
 }
 
-void IntersectionPriorityNode::set_approval(const bool granted)
+void IntersectionPriorityNode::set_approval(const std::string & intersection_id, const bool granted)
 {
-  if (approval_granted_ == granted) {
+  const auto light = virtual_traffic_lights_.find(intersection_id);
+  if (light == virtual_traffic_lights_.end() || light->second.approval_granted == granted) {
     return;
   }
-  approval_granted_ = granted;
-  last_waiting_key_.clear();
-  last_waiting_log_time_.reset();
-  approval_conditions_since_.reset();
+  auto & control = light->second;
+  control.approval_granted = granted;
+  control.last_waiting_key.clear();
+  control.last_waiting_log_time.reset();
+  control.approval_conditions_since.reset();
   RCLCPP_INFO(
     get_logger(), "%s: intersection_id=%s, virtual_traffic_light_id=%s",
-    granted ? "RIGHT_OF_WAY_GRANTED" : "RIGHT_OF_WAY_REVOKED", intersection_id_.c_str(),
-    virtual_traffic_light_id_.c_str());
+    granted ? "RIGHT_OF_WAY_GRANTED" : "RIGHT_OF_WAY_REVOKED", intersection_id.c_str(),
+    control.id.c_str());
+}
+
+void IntersectionPriorityNode::reset_pending_approvals()
+{
+  for (auto & entry : virtual_traffic_lights_) {
+    entry.second.approval_conditions_since.reset();
+  }
 }
 
 void IntersectionPriorityNode::update_approval_conditions(const rclcpp::Time & receive_time)
 {
-  if (approval_granted_) {
-    return;
-  }
-  const auto queue = arrival_queues_.find(intersection_id_);
-  const bool ego_first = queue != arrival_queues_.end() && !queue->second.empty() &&
-                         queue->second.front().type == ParticipantType::EGO;
-  const auto ego = ego_zone_states_.find(intersection_id_);
-  const bool ego_in_priority =
-    ego != ego_zone_states_.end() && ego->second.state == ZoneState::PRIORITY;
-  // Include objects that entered CONFLICT directly, without joining the queue.
-  const bool conflict_occupied =
-    std::any_of(object_zone_states_.begin(), object_zone_states_.end(), [this](const auto & entry) {
-      return entry.first.second == intersection_id_ && entry.second.state == ZoneState::CONFLICT;
-    });
   const bool fresh =
     last_tracked_objects_time_ && (receive_time - *last_tracked_objects_time_).seconds() >= 0.0 &&
     (receive_time - *last_tracked_objects_time_).seconds() <= tracked_objects_freshness_sec_;
-  if (!ego_first || !ego_in_priority || conflict_occupied || !fresh) {
-    approval_conditions_since_.reset();
-  } else if (!approval_conditions_since_) {
-    approval_conditions_since_ = receive_time;
+  for (auto & [intersection_id, control] : virtual_traffic_lights_) {
+    if (control.approval_granted) {
+      continue;
+    }
+    const auto queue = arrival_queues_.find(intersection_id);
+    const bool ego_first = queue != arrival_queues_.end() && !queue->second.empty() &&
+                           queue->second.front().type == ParticipantType::EGO;
+    const auto ego = ego_zone_states_.find(intersection_id);
+    const bool ego_in_priority =
+      ego != ego_zone_states_.end() && ego->second.state == ZoneState::PRIORITY;
+    // A missing conflict polygon must not be interpreted as a clear conflict zone.
+    const auto group = intersections_.find(intersection_id);
+    const bool has_polygons = group != intersections_.end() &&
+                              !group->second.priority_polygons.empty() &&
+                              !group->second.conflict_polygons.empty();
+    // Include direct CONFLICT entries, but only in this intersection.
+    const bool conflict_occupied = std::any_of(
+      object_zone_states_.begin(), object_zone_states_.end(),
+      [&intersection_id](const auto & entry) {
+        return entry.first.second == intersection_id && entry.second.state == ZoneState::CONFLICT;
+      });
+    if (!has_polygons || !ego_first || !ego_in_priority || conflict_occupied || !fresh) {
+      control.approval_conditions_since.reset();
+    } else if (!control.approval_conditions_since) {
+      control.approval_conditions_since = receive_time;
+    }
   }
 }
 
-void IntersectionPriorityNode::log_waiting_status(const rclcpp::Time & receive_time)
+void IntersectionPriorityNode::log_waiting_status(
+  const std::string & intersection_id, VirtualTrafficLightControl & control,
+  const rclcpp::Time & receive_time)
 {
-  const auto ego = ego_zone_states_.find(intersection_id_);
+  const auto ego = ego_zone_states_.find(intersection_id);
   if (
-    approval_granted_ || ego == ego_zone_states_.end() || ego->second.state == ZoneState::OUTSIDE) {
-    last_waiting_key_.clear();
-    last_waiting_log_time_.reset();
+    control.approval_granted || ego == ego_zone_states_.end() ||
+    ego->second.state == ZoneState::OUTSIDE) {
+    control.last_waiting_key.clear();
+    control.last_waiting_log_time.reset();
     return;
   }
 
-  const auto queue = arrival_queues_.find(intersection_id_);
+  const auto queue = arrival_queues_.find(intersection_id);
   std::size_t ego_position = 0;
   const std::size_t queue_size = queue == arrival_queues_.end() ? 0 : queue->second.size();
   std::string queue_head;
@@ -481,7 +524,7 @@ void IntersectionPriorityNode::log_waiting_status(const rclcpp::Time & receive_t
   }
   std::vector<std::string> blockers;
   for (const auto & [key, tracked] : object_zone_states_) {
-    if (key.second == intersection_id_ && tracked.state == ZoneState::CONFLICT) {
+    if (key.second == intersection_id && tracked.state == ZoneState::CONFLICT) {
       blockers.push_back(key.first);
     }
   }
@@ -491,7 +534,12 @@ void IntersectionPriorityNode::log_waiting_status(const rclcpp::Time & receive_t
   const auto data_status =
     object_data_status_ == "VALID" && !fresh ? std::string{"STALE"} : object_data_status_;
   const char * reason = "CLEAR_DURATION_PENDING";
-  if (ego->second.state != ZoneState::PRIORITY) {
+  const auto group = intersections_.find(intersection_id);
+  if (
+    group == intersections_.end() || group->second.priority_polygons.empty() ||
+    group->second.conflict_polygons.empty()) {
+    reason = "MAP_POLYGONS_MISSING";
+  } else if (ego->second.state != ZoneState::PRIORITY) {
     reason = "EGO_NOT_IN_PRIORITY";
   } else if (ego_position == 0) {
     reason = "EGO_NOT_IN_QUEUE";
@@ -510,14 +558,14 @@ void IntersectionPriorityNode::log_waiting_status(const rclcpp::Time & receive_t
   for (const auto & uuid : blockers) {
     key << '|' << uuid;
   }
-  const bool changed = key.str() != last_waiting_key_;
+  const bool changed = key.str() != control.last_waiting_key;
   if (
-    !changed && last_waiting_log_time_ &&
-    (receive_time - *last_waiting_log_time_).seconds() < 1.0) {
+    !changed && control.last_waiting_log_time &&
+    (receive_time - *control.last_waiting_log_time).seconds() < 1.0) {
     return;
   }
-  last_waiting_key_ = key.str();
-  last_waiting_log_time_ = receive_time;
+  control.last_waiting_key = key.str();
+  control.last_waiting_log_time = receive_time;
   const auto emit = [this, changed](const std::string & message) {
     if (changed) {
       RCLCPP_INFO(get_logger(), "%s", message.c_str());
@@ -538,7 +586,7 @@ void IntersectionPriorityNode::log_waiting_status(const rclcpp::Time & receive_t
     head_seen == object_last_seen_times_.end() ? std::nullopt
                                                : std::optional<rclcpp::Time>{head_seen->second};
   std::ostringstream summary;
-  summary << "WAITING: intersection_id=" << intersection_id_ << ", reason=" << reason
+  summary << "WAITING: intersection_id=" << intersection_id << ", reason=" << reason
           << ", ego_state=" << state_name(ego->second.state)
           << ", ego_queue_position=" << ego_position << ", queue_size=" << queue_size
           << ", queue_head=" << (queue_head.empty() ? "none" : queue_head)
@@ -549,7 +597,7 @@ void IntersectionPriorityNode::log_waiting_status(const rclcpp::Time & receive_t
           << ", last_message_age=" << age_text(last_objects_message_time_, receive_time)
           << ", freshness_limit=" << tracked_objects_freshness_sec_ << 's'
           << ", conflict_objects=" << blockers.size()
-          << ", clear_elapsed=" << age_text(approval_conditions_since_, receive_time)
+          << ", clear_elapsed=" << age_text(control.approval_conditions_since, receive_time)
           << ", clear_required=" << conflict_clear_duration_sec_ << 's';
   emit(summary.str());
   for (const auto & uuid : blockers) {
@@ -558,7 +606,7 @@ void IntersectionPriorityNode::log_waiting_status(const rclcpp::Time & receive_t
                                                     ? std::nullopt
                                                     : std::optional<rclcpp::Time>{seen->second};
     std::ostringstream blocker;
-    blocker << "WAITING_BLOCKER: intersection_id=" << intersection_id_
+    blocker << "WAITING_BLOCKER: intersection_id=" << intersection_id
             << ", reason=CONFLICT_OCCUPIED, UUID=" << uuid
             << ", last_seen_age=" << age_text(last_seen, receive_time)
             << ", timeout=" << tracked_object_timeout_sec_ << 's';
@@ -572,24 +620,27 @@ void IntersectionPriorityNode::publish_virtual_traffic_light()
   // Cleanup remains active even after approval has been latched.
   remove_stale_objects(receive_time);
   update_approval_conditions(receive_time);
-  if (
-    !approval_granted_ && approval_conditions_since_ &&
-    (receive_time - *approval_conditions_since_).seconds() >= conflict_clear_duration_sec_) {
-    set_approval(true);
-  }
-
-  log_waiting_status(receive_time);
-
   const auto stamp = now();
   tier4_v2x_msgs::msg::VirtualTrafficLightStateArray message;
   message.stamp = stamp;
-  tier4_v2x_msgs::msg::VirtualTrafficLightState state;
-  state.stamp = stamp;
-  state.type = virtual_traffic_light_type_;
-  state.id = virtual_traffic_light_id_;
-  state.approval = approval_granted_;
-  state.is_finalized = false;
-  message.states.push_back(state);
+  message.states.reserve(virtual_traffic_lights_.size());
+  for (auto & [intersection_id, control] : virtual_traffic_lights_) {
+    if (
+      !control.approval_granted && control.approval_conditions_since &&
+      (receive_time - *control.approval_conditions_since).seconds() >=
+        conflict_clear_duration_sec_) {
+      set_approval(intersection_id, true);
+    }
+    log_waiting_status(intersection_id, control, receive_time);
+
+    tier4_v2x_msgs::msg::VirtualTrafficLightState state;
+    state.stamp = stamp;
+    state.type = virtual_traffic_light_type_;
+    state.id = control.id;
+    state.approval = control.approval_granted;
+    state.is_finalized = false;
+    message.states.push_back(state);
+  }
   virtual_traffic_light_publisher_->publish(message);
 }
 
@@ -598,10 +649,14 @@ void IntersectionPriorityNode::on_map(
 {
   // Preserve exit detection for an ongoing grant across map updates. Map/queue changes
   // must not revoke approval while ego is crossing; only its observed exit does.
-  std::optional<EgoZoneState> granted_ego_state;
-  const auto ego = ego_zone_states_.find(intersection_id_);
-  if (approval_granted_ && ego != ego_zone_states_.end()) {
-    granted_ego_state = ego->second;
+  std::map<std::string, EgoZoneState> granted_ego_states;
+  for (auto & [intersection_id, control] : virtual_traffic_lights_) {
+    const auto ego = ego_zone_states_.find(intersection_id);
+    if (control.approval_granted && ego != ego_zone_states_.end()) {
+      granted_ego_states.emplace(intersection_id, ego->second);
+    }
+    control.last_waiting_key.clear();
+    control.last_waiting_log_time.reset();
   }
   // Never retain stale geometry after a replacement map, even if decoding fails.
   for (auto & [intersection_id, queue] : arrival_queues_) {
@@ -611,20 +666,13 @@ void IntersectionPriorityNode::on_map(
     }
   }
   arrival_queues_.clear();
-  ego_zone_states_.clear();
-  active_intersection_id_.reset();
-  if (granted_ego_state) {
-    ego_zone_states_[intersection_id_] = *granted_ego_state;
-    active_intersection_id_ = intersection_id_;
-  }
+  ego_zone_states_ = std::move(granted_ego_states);
   object_zone_states_.clear();
   object_last_seen_times_.clear();
   last_objects_message_time_.reset();
   object_data_status_ = "NOT_RECEIVED";
-  last_waiting_key_.clear();
-  last_waiting_log_time_.reset();
   last_tracked_objects_time_.reset();
-  approval_conditions_since_.reset();
+  reset_pending_approvals();
   intersections_.clear();
   ungrouped_polygons_ = {};
   auto map = std::make_shared<lanelet::LaneletMap>();
@@ -698,6 +746,18 @@ void IntersectionPriorityNode::on_map(
       RCLCPP_WARN(
         get_logger(), "Intersection ID=%s has %zu conflict polygons; expected one, retaining all.",
         intersection_id.c_str(), group.conflict_polygons.size());
+    }
+  }
+  for (const auto & [intersection_id, control] : virtual_traffic_lights_) {
+    const auto group = intersections_.find(intersection_id);
+    if (
+      group == intersections_.end() || group->second.priority_polygons.empty() ||
+      group->second.conflict_polygons.empty()) {
+      RCLCPP_WARN(
+        get_logger(),
+        "Intersection ID=%s, virtual_traffic_light_id=%s: missing priority or conflict polygons; "
+        "new approval is disabled for this intersection.",
+        intersection_id.c_str(), control.id.c_str());
     }
   }
   if (!has_priority_polygon) {

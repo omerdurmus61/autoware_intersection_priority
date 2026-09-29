@@ -1,7 +1,11 @@
 /**:
   ros__parameters:
-    intersection_id: "1"
-    virtual_traffic_light_id: "2012980"
+    intersection_ids: ["1", "2"]
+    intersections:
+      "1":
+        virtual_traffic_light_id: "2012980"
+      "2":
+        virtual_traffic_light_id: "2013058"
     virtual_traffic_light_type: "virtual"
     virtual_traffic_light_publish_rate_hz: 10.0
 

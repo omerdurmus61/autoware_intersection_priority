@@ -69,8 +69,19 @@ private:
   struct EgoZoneState
   {
     ZoneState state{ZoneState::OUTSIDE};
-    // First PRIORITY entry during the current visit, using the odometry timestamp.
+    // Marks this intersection active from first PRIORITY entry until ego exits.
+    // Uses the odometry timestamp, independently for each intersection.
     std::optional<rclcpp::Time> priority_entry_time;
+  };
+
+  struct VirtualTrafficLightControl
+  {
+    std::string id;
+    bool approval_granted{false};
+    std::optional<rclcpp::Time> approval_conditions_since;
+    // Diagnostics are independent for each intersection.
+    std::string last_waiting_key;
+    std::optional<rclcpp::Time> last_waiting_log_time;
   };
 
   static ZoneState zone_state(
@@ -90,14 +101,16 @@ private:
   void remove_tracked_object(const std::string & uuid, const char * event);
   void remove_stale_objects(const rclcpp::Time & receive_time);
   void update_approval_conditions(const rclcpp::Time & receive_time);
-  void log_waiting_status(const rclcpp::Time & receive_time);
+  void reset_pending_approvals();
+  void log_waiting_status(
+    const std::string & intersection_id, VirtualTrafficLightControl & control,
+    const rclcpp::Time & receive_time);
   void publish_virtual_traffic_light();
-  void set_approval(bool granted);
+  void set_approval(const std::string & intersection_id, bool granted);
 
   void on_map(const autoware_map_msgs::msg::LaneletMapBin::ConstSharedPtr msg);
 
-  std::string intersection_id_;
-  std::string virtual_traffic_light_id_;
+  std::map<std::string, VirtualTrafficLightControl> virtual_traffic_lights_;
   std::string virtual_traffic_light_type_;
   double tracked_object_timeout_sec_;
   double conflict_clear_duration_sec_;
@@ -107,12 +120,9 @@ private:
   rclcpp::Clock receive_clock_{RCL_STEADY_TIME};
   std::map<std::string, rclcpp::Time> object_last_seen_times_;
   std::optional<rclcpp::Time> last_tracked_objects_time_;
-  std::optional<rclcpp::Time> approval_conditions_since_;
   // Diagnostics only: these fields do not participate in approval decisions.
   std::optional<rclcpp::Time> last_objects_message_time_;
   std::string object_data_status_{"NOT_RECEIVED"};
-  std::string last_waiting_key_;
-  std::optional<rclcpp::Time> last_waiting_log_time_;
 
   rclcpp::Subscription<autoware_map_msgs::msg::LaneletMapBin>::SharedPtr map_subscription_;
   rclcpp::Subscription<autoware_perception_msgs::msg::TrackedObjects>::SharedPtr
@@ -121,7 +131,6 @@ private:
   rclcpp::Publisher<tier4_v2x_msgs::msg::VirtualTrafficLightStateArray>::SharedPtr
     virtual_traffic_light_publisher_;
   rclcpp::TimerBase::SharedPtr virtual_traffic_light_timer_;
-  bool approval_granted_{false};
   // Coordinates are stored in the vector map's frame, preserving Area holes.
   std::map<std::string, IntersectionPolygons> intersections_;
   // Preserve geometry from older maps without assigning it to a made-up intersection.
@@ -130,8 +139,6 @@ private:
   // Missing observations do not imply OUTSIDE; timeout cleanup removes stale history.
   std::map<std::pair<std::string, std::string>, ObjectZoneState> object_zone_states_;
   std::map<std::string, EgoZoneState> ego_zone_states_;
-  // Entry time is stored in the corresponding ego_zone_states_ record.
-  std::optional<std::string> active_intersection_id_;
   // Ordered by observed arrival timestamp only; equal timestamps retain insertion order.
   std::map<std::string, std::vector<ArrivalEntry>> arrival_queues_;
 };

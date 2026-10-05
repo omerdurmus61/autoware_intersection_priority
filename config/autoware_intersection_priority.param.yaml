@@ -12,7 +12,7 @@
     vector_map_topic: "/map/vector_map"
     tracked_objects_topic: "/perception/object_recognition/tracking/objects"
     odometry_topic: "/localization/kinematic_state"
-    virtual_traffic_light_state_topic: "/awapi/tmp/virtual_traffic_light_states"
+    virtual_traffic_light_state_topic: "/vtl/intersection_states"
 
     tracked_object_timeout_sec: 4.0
     conflict_clear_duration_sec: 0.5

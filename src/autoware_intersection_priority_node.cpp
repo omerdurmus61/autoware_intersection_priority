@@ -68,7 +68,7 @@ IntersectionPriorityNode::IntersectionPriorityNode(const rclcpp::NodeOptions & o
   const auto odometry_topic =
     declare_parameter<std::string>("odometry_topic", "/localization/kinematic_state");
   const auto vtl_topic = declare_parameter<std::string>(
-    "virtual_traffic_light_state_topic", "/awapi/tmp/virtual_traffic_light_states");
+    "virtual_traffic_light_state_topic", "/vtl/intersection_states");
   tracked_object_timeout_sec_ = declare_parameter<double>("tracked_object_timeout_sec", 1.0);
   conflict_clear_duration_sec_ = declare_parameter<double>("conflict_clear_duration_sec", 0.5);
   tracked_objects_freshness_sec_ = declare_parameter<double>("tracked_objects_freshness_sec", 0.5);

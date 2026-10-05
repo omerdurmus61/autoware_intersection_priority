@@ -37,6 +37,16 @@ preserving exit detection for an already-latched grant.
 Publish rate, timeout and freshness must be finite and positive; clear duration
 must be finite and nonnegative. Zero clear duration disables the waiting interval.
 
+## VTL output routing
+
+Run `autoware_virtual_traffic_light_mux` alongside this node. The intersection
+output is `/vtl/intersection_states`; the mux combines it with `/vtl/driver_states`
+and publishes the final array on `/awapi/tmp/virtual_traffic_light_states`.
+Only the mux should publish to that final topic. The launch file here starts
+only the intersection node; start the mux with its own launch file.
+Adding an intersection requires no ID configuration in the mux; it forwards
+all states received on this node's output topic.
+
 ## Adding intersections
 
 Extend both the ID list and the corresponding mapping in the existing YAML:
@@ -60,7 +70,8 @@ instrument ID used by Autoware's VTL configuration, independent of polygon IDs.
 Rebuild/install the package after editing its source configuration and restart
 the node. No C++ changes are needed to add another mapping.
 
-Every timer tick publishes one `VirtualTrafficLightStateArray` containing all
+Every timer tick publishes one `VirtualTrafficLightStateArray` on
+`/vtl/intersection_states`, containing all
 configured lights, including lights with `approval=false`. Each intersection
 has its own queue, clear interval, approval latch, and waiting diagnostics.
 Occupancy or ego exit in one intersection does not change another's approval.
@@ -123,7 +134,8 @@ For the next field test, record the input/output topics in a separate terminal:
 ```bash
 ros2 bag record /map/vector_map \
   /perception/object_recognition/tracking/objects \
-  /localization/kinematic_state /awapi/tmp/virtual_traffic_light_states /clock
+  /localization/kinematic_state /vtl/intersection_states /vtl/driver_states \
+  /awapi/tmp/virtual_traffic_light_states /clock
 ```
 
 Use your configured topic names if they differ from these defaults. Preserve

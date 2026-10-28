@@ -9,6 +9,7 @@ import subprocess
 import time
 import uuid
 
+from diagnostic_msgs.msg import DiagnosticArray
 from autoware_map_msgs.msg import LaneletMapBin
 from autoware_perception_msgs.msg import TrackedObject, TrackedObjects
 from nav_msgs.msg import Odometry
@@ -35,6 +36,7 @@ class Harness:
         for key, suffix in (
             ('vector_map_topic', '/map'), ('tracked_objects_topic', '/objects'),
             ('odometry_topic', '/odom'), ('virtual_traffic_light_state_topic', '/vtl'),
+            ('queue_state_topic', '/queues'),
         ):
             params[key] = prefix + suffix
         params.update(tracked_object_timeout_sec=0.4, tracked_objects_freshness_sec=0.25)
@@ -50,6 +52,10 @@ class Harness:
         param_file = tmp_path / 'params.yaml'
         param_file.write_text(yaml.safe_dump(self.params))
         self.samples = []
+        self.queue_samples = []
+        self.queue_sub = self.node.create_subscription(
+            DiagnosticArray, prefix + "/queues",
+            lambda msg: self.queue_samples.append(msg), 1)
         qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.map_pub = self.node.create_publisher(LaneletMapBin, prefix + '/map', qos)
         self.objects_pub = self.node.create_publisher(TrackedObjects, prefix + '/objects', 1)
@@ -265,3 +271,31 @@ def test_invalid_mapping_rejected(tmp_path, ids, mappings):
     assert result.returncode != 0
     assert 'CONFIGURATION:' not in result.stdout
     assert 'ID' in result.stdout
+
+
+def test_queue_visualization_snapshot(harness):
+    h = harness
+    h.load_map()
+    h.pump(0.2, objects=[(1, 2)], ego=55)
+    h.pump(0.2, objects=[(1, 2)], ego=2)
+
+    def queue(intersection="1"):
+        status = next(s for s in h.queue_samples[-1].status if s.name == intersection)
+        return [(v.key, v.value) for v in status.values]
+
+    uuid = '00000000-0000-0000-0000-000000000001'
+    assert queue() == [(uuid, 'PRIORITY'), ('AV', 'PRIORITY')]
+    assert queue("2") == []
+    h.pump(0.2, objects=[(1, 9)], ego=2)
+    assert queue() == [(uuid, 'CONFLICT'), ('AV', 'PRIORITY')]
+    h.pump(0.2, objects=[(1, 55)], ego=2)
+    assert queue() == [('AV', 'PRIORITY')]  # Exit removes row and AV moves up.
+    h.pump(0.7, objects=[], ego=2)
+    status = next(s for s in h.queue_samples[-1].status if s.name == '1')
+    assert status.message == 'APPROVED'
+    h.pump(0.2, objects=[], ego=55)
+    assert queue() == []
+    h.pump(0.2, objects=[(2, 2)], ego=55)
+    assert len(queue()) == 1
+    h.pump(0.7, objects=[], ego=55)
+    assert queue() == []  # Timeout removes rows too.

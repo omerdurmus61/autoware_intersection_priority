@@ -107,6 +107,9 @@ IntersectionPriorityNode::IntersectionPriorityNode(const rclcpp::NodeOptions & o
       vtl_topic, rclcpp::QoS{10});
   virtual_traffic_light_timer_ = create_wall_timer(
     publish_period, std::bind(&IntersectionPriorityNode::publish_virtual_traffic_light, this));
+  queue_publisher_ = create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
+    declare_parameter<std::string>("queue_state_topic", "/intersection_priority/queues"),
+    rclcpp::QoS{1}.reliable().transient_local());
   for (const auto & [intersection_id, control] : virtual_traffic_lights_) {
     RCLCPP_INFO(
       get_logger(),
@@ -642,6 +645,36 @@ void IntersectionPriorityNode::publish_virtual_traffic_light()
     message.states.push_back(state);
   }
   virtual_traffic_light_publisher_->publish(message);
+  publish_queue_snapshot();
+}
+
+// Read-only telemetry: preserve the exact decision queue order and membership.
+void IntersectionPriorityNode::publish_queue_snapshot()
+{
+  diagnostic_msgs::msg::DiagnosticArray snapshot;
+  snapshot.header.stamp = now();
+  const auto receive_time = receive_clock_.now();
+  const bool fresh = last_tracked_objects_time_ &&
+    (receive_time - *last_tracked_objects_time_).seconds() <= tracked_objects_freshness_sec_;
+  for (const auto & [intersection_id, control] : virtual_traffic_lights_) {
+    diagnostic_msgs::msg::DiagnosticStatus status;
+    status.name = intersection_id;
+    status.hardware_id = control.id;
+    status.level = fresh ? diagnostic_msgs::msg::DiagnosticStatus::OK :
+      diagnostic_msgs::msg::DiagnosticStatus::WARN;
+    status.message = control.approval_granted ? "APPROVED" : "WAITING";
+    const auto queue = arrival_queues_.find(intersection_id);
+    if (queue != arrival_queues_.end()) {
+      for (const auto & entry : queue->second) {
+        diagnostic_msgs::msg::KeyValue participant;
+        participant.key = entry.type == ParticipantType::EGO ? "AV" : entry.identifier;
+        participant.value = state_name(entry.state);
+        status.values.push_back(std::move(participant));
+      }
+    }
+    snapshot.status.push_back(std::move(status));
+  }
+  queue_publisher_->publish(snapshot);
 }
 
 void IntersectionPriorityNode::on_map(

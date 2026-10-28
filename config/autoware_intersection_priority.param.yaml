@@ -9,6 +9,7 @@
     virtual_traffic_light_type: "virtual"
     virtual_traffic_light_publish_rate_hz: 10.0
 
+    queue_state_topic: "/intersection_priority/queues"
     vector_map_topic: "/map/vector_map"
     tracked_objects_topic: "/perception/object_recognition/tracking/objects"
     odometry_topic: "/localization/kinematic_state"

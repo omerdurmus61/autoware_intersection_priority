@@ -5,6 +5,7 @@
 #define AUTOWARE_INTERSECTION_PRIORITY__AUTOWARE_INTERSECTION_PRIORITY_NODE_HPP_
 
 #include <rclcpp/rclcpp.hpp>
+#include <diagnostic_msgs/msg/diagnostic_array.hpp>
 
 #include <autoware_map_msgs/msg/lanelet_map_bin.hpp>
 #include <autoware_perception_msgs/msg/tracked_objects.hpp>
@@ -106,6 +107,7 @@ private:
     const std::string & intersection_id, VirtualTrafficLightControl & control,
     const rclcpp::Time & receive_time);
   void publish_virtual_traffic_light();
+  void publish_queue_snapshot();
   void set_approval(const std::string & intersection_id, bool granted);
 
   void on_map(const autoware_map_msgs::msg::LaneletMapBin::ConstSharedPtr msg);
@@ -131,6 +133,7 @@ private:
   rclcpp::Publisher<tier4_v2x_msgs::msg::VirtualTrafficLightStateArray>::SharedPtr
     virtual_traffic_light_publisher_;
   rclcpp::TimerBase::SharedPtr virtual_traffic_light_timer_;
+  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr queue_publisher_;
   // Coordinates are stored in the vector map's frame, preserving Area holes.
   std::map<std::string, IntersectionPolygons> intersections_;
   // Preserve geometry from older maps without assigning it to a made-up intersection.

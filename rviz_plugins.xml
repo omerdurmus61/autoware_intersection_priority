@@ -1,0 +1,5 @@
+<library path="autoware_intersection_priority_rviz_plugin">
+  <class name="autoware_intersection_priority/QueuePanel" type="autoware::intersection_priority::QueuePanel" base_class_type="rviz_common::Panel">
+    <description>Live intersection queues, AV position and number of vehicles ahead.</description>
+  </class>
+</library>

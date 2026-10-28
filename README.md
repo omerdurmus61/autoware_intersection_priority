@@ -237,3 +237,15 @@ Current decisions use observed arrival order and conflict occupancy. The node
 does not implement the right-hand rule, simultaneous-arrival right-of-way rules,
 left-turn priority, predicted vehicle trajectories, or polygon intersection with
 the full vehicle footprint.
+
+## RViz2 queue panel
+
+The read-only queue snapshot on `/intersection_priority/queues` is consumed by
+[the bundled RViz2 queue panel](docs/rviz_queue_panel.md).
+Add `autoware_intersection_priority/QueuePanel` through RViz's **Panels → Add New Panel**
+and dock it on the left. The panel shows the active intersection with four
+numbered vehicle boxes and highlights AV in yellow. Build this package to install
+both the node and panel; no separate RViz plugin package is needed.
+The `queue_state_topic` startup parameter changes this telemetry topic.
+Queue and approval rules are unchanged; a retained OUTSIDE entry remains visible
+until the algorithm actually removes it.
